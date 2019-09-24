@@ -110,7 +110,7 @@ namespace Akka.Routing
         /// <returns>The node associated with the data key</returns>
         public T NodeFor(byte[] key)
         {
-            if (IsEmpty) throw new InvalidOperationException($"Can't get node for [{key}] from an empty node ring");
+            if (IsEmpty) throw new InvalidOperationException($"Can't get node for key[{key}] from an empty node ring");
 
             return NodeRing[Idx(Array.BinarySearch(NodeHashRing, ConsistentHash.HashFor(key)))];
         }
@@ -125,9 +125,24 @@ namespace Akka.Routing
         /// <returns>The node associated with the data key</returns>
         public T NodeFor(string key)
         {
-            if (IsEmpty) throw new InvalidOperationException($"Can't get node for [{key}] from an empty node ring");
+            if (IsEmpty) throw new InvalidOperationException($"Can't get node for key[{key}] from an empty node ring");
 
             return NodeRing[Idx(Array.BinarySearch(NodeHashRing, ConsistentHash.HashFor(key)))];
+        }
+
+        /// <summary>
+        /// Retrieves the node associated with the hash key
+        /// </summary>
+        /// <param name="hash">The hash used for lookup.</param>
+        /// <exception cref="InvalidOperationException">
+        /// This exception is thrown if the node ring is empty.
+        /// </exception>
+        /// <returns>The node associated with the hash key</returns>
+        public T NodeFor(int hash)
+        {
+            if (IsEmpty) throw new InvalidOperationException($"Can't get node for hash[{hash}] from an empty node ring");
+
+            return NodeRing[Idx(Array.BinarySearch(NodeHashRing, hash))];
         }
 
         /// <summary>
@@ -286,8 +301,8 @@ namespace Akka.Routing
         /// if it needs to be serialized first.
         /// </summary>
         /// <param name="obj">An arbitrary .NET object</param>
-        /// <returns>The object encoded into bytes - in the case of custom classes, the hashcode may be used.</returns>
-        internal static object ToBytesOrObject(object obj)
+        /// <returns>The object encoded into bytes or the given object</returns>
+        public static object ToBytesOrObject(object obj)
         {
             switch (obj)
             {
@@ -329,7 +344,7 @@ namespace Akka.Routing
         /// </summary>
         /// <param name="bytes">TBD</param>
         /// <returns>TBD</returns>
-        internal static int HashFor(byte[] bytes)
+        public static int HashFor(byte[] bytes)
         {
             return MurmurHash.ByteHash(bytes);
         }
@@ -339,7 +354,7 @@ namespace Akka.Routing
         /// </summary>
         /// <param name="hashKey">TBD</param>
         /// <returns>TBD</returns>
-        internal static int HashFor(string hashKey)
+        public static int HashFor(string hashKey)
         {
             return MurmurHash.StringHash(hashKey);
         }

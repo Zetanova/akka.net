@@ -42,6 +42,21 @@ namespace Akka.Routing
         object ConsistentHashKey { get; }
     }
 
+    /// <summary>
+    /// This struct holds the hash key value
+    /// <see cref="ConsistentHashingGroup"/> or <see cref="ConsistentHashingPool"/>
+    /// routers.
+    /// </summary>
+    public struct ConsistentHashKey
+    {
+        public readonly int Value;
+
+        public ConsistentHashKey(int value)
+        {
+            Value = value;
+        }
+    }
+
 
     /// <summary>
     /// This class represents a <see cref="RouterEnvelope"/> that can be wrapped around a message in order to make
@@ -80,10 +95,12 @@ namespace Akka.Routing
 
     /// <summary>
     /// Delegate for computing the hashkey from any given type of message. Extracts the property / data
-    /// that is going to be used for a given hash, but doesn't actually return the hash values themselves.
+    /// that is going to be used for a given hash.
     /// 
     /// If returning a byte[] or string it will be used as is, otherwise the configured
     /// <see cref="Serializer"/> will be applied to the returned data.
+    /// 
+    /// If returning <see cref="ConsistentHashKey"/> the hash value will be used directly
     /// </summary>
     public delegate object ConsistentHashMapping(object msg);
 
@@ -192,18 +209,19 @@ namespace Akka.Routing
                 try
                 {
                     var currentConsistentHash = UpdateConsistentHash();
-                    if (currentConsistentHash.IsEmpty) return Routee.NoRoutee;
-                    else
+                    if (currentConsistentHash.IsEmpty)
+                        return Routee.NoRoutee;
+
+                    switch (hashData)
                     {
-                        switch (hashData)
-                        {
-                            case byte[] bytes:
-                                return currentConsistentHash.NodeFor(bytes).Routee;
-                            case string data:
-                                return currentConsistentHash.NodeFor(data).Routee;
-                            default:
-                                return currentConsistentHash.NodeFor(_system.Serialization.FindSerializerFor(hashData).ToBinary(hashData)).Routee;
-                        }
+                        case byte[] bytes:
+                            return currentConsistentHash.NodeFor(bytes).Routee;
+                        case string data:
+                            return currentConsistentHash.NodeFor(data).Routee;
+                        case ConsistentHashKey hash:
+                            return currentConsistentHash.NodeFor(hash.Value).Routee;
+                        default:
+                            return currentConsistentHash.NodeFor(_system.Serialization.FindSerializerFor(hashData).ToBinary(hashData)).Routee;
                     }
                 }
                 catch (Exception ex)
