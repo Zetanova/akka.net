@@ -16,6 +16,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace Helios.Concurrency
@@ -44,9 +45,9 @@ namespace Helios.Concurrency
         { }
 
         public DedicatedThreadPoolSettings(
-            int numThreads, 
-            ThreadType threadType, 
-            string name = null, 
+            int numThreads,
+            ThreadType threadType,
+            string name = null,
             TimeSpan? deadlockTimeout = null)
         {
             Name = name ?? ("DedicatedThreadPool-" + Guid.NewGuid());
@@ -274,7 +275,14 @@ namespace Helios.Concurrency
         /// <param name="settings">TBD</param>
         public DedicatedThreadPool(DedicatedThreadPoolSettings settings)
         {
-            _workQueue = new ThreadPoolWorkQueue();
+            //_workQueue = new ThreadPoolWorkQueue();
+            _workChannel = Channel.CreateUnbounded<Action>(new UnboundedChannelOptions
+            {
+                //AllowSynchronousContinuations
+                SingleReader = settings.NumThreads == 1
+                //SingleWriter
+            });
+
             Settings = settings;
             _workers = Enumerable.Range(1, settings.NumThreads).Select(workerId => new PoolWorker(this, workerId)).ToArray();
 
@@ -289,7 +297,8 @@ namespace Helios.Concurrency
         /// </summary>
         public DedicatedThreadPoolSettings Settings { get; private set; }
 
-        private readonly ThreadPoolWorkQueue _workQueue;
+        //private readonly ThreadPoolWorkQueue _workQueue;
+        private readonly Channel<Action> _workChannel;
         private readonly PoolWorker[] _workers;
 
         /// <summary>
@@ -304,7 +313,7 @@ namespace Helios.Concurrency
             if (work == null)
                 throw new ArgumentNullException(nameof(work), "Work item cannot be null.");
 
-            return _workQueue.TryAdd(work);
+            return _workChannel.Writer.TryWrite(work);
         }
 
         /// <summary>
@@ -312,7 +321,7 @@ namespace Helios.Concurrency
         /// </summary>
         public void Dispose()
         {
-            _workQueue.CompleteAdding();
+            _workChannel.Writer.Complete();
         }
 
         /// <summary>
@@ -332,7 +341,7 @@ namespace Helios.Concurrency
             Task.WaitAll(_workers.Select(worker => worker.ThreadExit).ToArray(), timeout);
         }
 
-#region Pool worker implementation
+        #region Pool worker implementation
 
         private class PoolWorker
         {
@@ -365,15 +374,26 @@ namespace Helios.Concurrency
             {
                 try
                 {
-                    foreach (var action in _pool._workQueue.GetConsumingEnumerable())
+                    var reader = _pool._workChannel.Reader;
+
+                    while (true)
                     {
-                        try
+                        if (reader.TryRead(out var action))
                         {
-                            action();
+                            try
+                            {
+                                action();
+                            }
+                            catch (Exception ex)
+                            {
+                                _pool.Settings.ExceptionHandler(ex);
+                            }
                         }
-                        catch (Exception ex)
+                        else
                         {
-                            _pool.Settings.ExceptionHandler(ex);
+                            var t = reader.WaitToReadAsync();
+                            if (t.IsCompleted ? !t.Result : !t.AsTask().GetAwaiter().GetResult())
+                                return; //completed
                         }
                     }
                 }
@@ -384,10 +404,11 @@ namespace Helios.Concurrency
             }
         }
 
-#endregion
+        #endregion
 
-#region WorkQueue implementation
+        #region WorkQueue implementation
 
+        [Obsolete]
         private class ThreadPoolWorkQueue
         {
             private static readonly int ProcessorCount = Environment.ProcessorCount;
@@ -510,9 +531,9 @@ namespace Helios.Concurrency
             }
         }
 
-#endregion
+        #endregion
 
-#region UnfairSemaphore implementation
+        #region UnfairSemaphore implementation
 
         // This class has been translated from:
         // https://github.com/dotnet/coreclr/blob/97433b9d153843492008652ff6b7c3bf4d9ff31c/src/vm/win32threadpool.h#L124
@@ -524,6 +545,7 @@ namespace Helios.Concurrency
         // UnfairSemaphore is only appropriate in scenarios where the order of unblocking threads is not important, and where threads frequently
         // need to be woken.
 
+        [Obsolete]
         [StructLayout(LayoutKind.Sequential)]
         private sealed class UnfairSemaphore
         {
@@ -739,7 +761,7 @@ namespace Helios.Concurrency
             }
         }
 
-#endregion
+        #endregion
     }
 }
 
