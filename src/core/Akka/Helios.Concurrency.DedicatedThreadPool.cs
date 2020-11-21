@@ -6,7 +6,7 @@
 //-----------------------------------------------------------------------
 
 /*
- * Copyright 2015 Roger Alsing, Aaron Stannard
+ * Copyright 2015-2016 Roger Alsing, Aaron Stannard, Jeff Cyr
  * Helios.DedicatedThreadPool - https://github.com/helios-io/DedicatedThreadPool
  */
 using System;
@@ -33,27 +33,27 @@ namespace Helios.Concurrency
     /// <summary>
     /// Provides settings for a dedicated thread pool
     /// </summary>
-    internal class DedicatedThreadPoolSettings
+    internal sealed class DedicatedThreadPoolSettings
     {
         /// <summary>
         /// Background threads are the default thread type
         /// </summary>
         public const ThreadType DefaultThreadType = ThreadType.Background;
 
-        public DedicatedThreadPoolSettings(int numThreads, string name = null, TimeSpan? deadlockTimeout = null)
-            : this(numThreads, DefaultThreadType, name, deadlockTimeout)
+        public DedicatedThreadPoolSettings(int numThreads, string name = null, TimeSpan? deadlockTimeout = null, Action<Exception> exceptionHandler = null)
+            : this(numThreads, DefaultThreadType, name, deadlockTimeout, exceptionHandler)
         { }
 
-        public DedicatedThreadPoolSettings(
-            int numThreads,
-            ThreadType threadType,
-            string name = null,
-            TimeSpan? deadlockTimeout = null)
+        public DedicatedThreadPoolSettings(int numThreads, ThreadType threadType, string name = null, TimeSpan? deadlockTimeout = null, Action<Exception> exceptionHandler = null)
         {
             Name = name ?? ("DedicatedThreadPool-" + Guid.NewGuid());
             ThreadType = threadType;
             NumThreads = numThreads;
+            MinThreads = Math.Min(2, numThreads);
+            MaxThreads = Math.Max(numThreads, Math.Max(2, Environment.ProcessorCount - 1)); //todo find core count
             DeadlockTimeout = deadlockTimeout;
+            ExceptionHandler = exceptionHandler ?? (ex => { });
+
             if (deadlockTimeout.HasValue && deadlockTimeout.Value.TotalMilliseconds <= 0)
                 throw new ArgumentOutOfRangeException("deadlockTimeout", string.Format("deadlockTimeout must be null or at least 1ms. Was {0}.", deadlockTimeout));
             if (numThreads <= 0)
@@ -64,6 +64,17 @@ namespace Helios.Concurrency
         /// The total number of threads to run in this thread pool.
         /// </summary>
         public int NumThreads { get; private set; }
+
+        /// <summary>
+        /// The min number of threads to run in this thread pool.
+        /// Zero thread count is supported
+        /// </summary>
+        public int MinThreads { get; private set; }
+
+        /// <summary>
+        /// The max number of threads to run in this thread pool.
+        /// </summary>
+        public int MaxThreads { get; private set; }
 
         /// <summary>
         /// The type of threads to run in this thread pool.
@@ -89,28 +100,38 @@ namespace Helios.Concurrency
         public Action<Exception> ExceptionHandler { get; private set; }
 
         /// <summary>
-        /// Gets the thread stack size, 0 represents the default stack size.
+        /// The type of threads to run in this thread pool.
         /// </summary>
-        public int ThreadMaxStackSize { get; private set; }
+        public bool AllowSynchronousContinuations { get; private set; } = true;
+
+        /// <summary>
+        /// QueueUserWorkItem is sychronous called 
+        /// </summary>
+        public bool SynchronousScheduler { get; private set; } = true;
     }
 
     /// <summary>
     /// TaskScheduler for working with a <see cref="DedicatedThreadPool"/> instance
     /// </summary>
-    internal class DedicatedThreadPoolTaskScheduler : TaskScheduler
+    internal sealed class DedicatedThreadPoolTaskScheduler : TaskScheduler
     {
         // Indicates whether the current thread is processing work items.
         [ThreadStatic]
         private static bool _currentThreadIsRunningTasks;
 
         /// <summary>
-        /// Number of tasks currently running
+        /// Number of workers currently running
         /// </summary>
-        private volatile int _parallelWorkers = 0;
+        private int _parallelWorkers = 0; //synced by _tasks lock
+
+        /// <summary>
+        /// Number of tasks currently waiting
+        /// </summary>
+        private int _waitingWork = 0; //estimated, synced by _tasks lock
 
         private readonly LinkedList<Task> _tasks = new LinkedList<Task>();
 
-        private readonly DedicatedThreadPool _pool;
+        private readonly DedicatedThreadPool _pool;  //queue work is synced by _tasks lock
 
         /// <summary>
         /// TBD
@@ -130,9 +151,15 @@ namespace Helios.Concurrency
             lock (_tasks)
             {
                 _tasks.AddLast(task);
-            }
+                _waitingWork++;
 
-            EnsureWorkerRequested();
+                //request new worker
+                if (_parallelWorkers < _pool.Settings.MaxThreads)
+                {
+                    _parallelWorkers++;
+                    RequestWorker();
+                }
+            }
         }
 
         /// <summary>
@@ -146,12 +173,9 @@ namespace Helios.Concurrency
             if (!_currentThreadIsRunningTasks) return false;
 
             //remove the task from the queue if it was previously added
-            if (taskWasPreviouslyQueued)
-                if (TryDequeue(task))
-                    return TryExecuteTask(task);
-                else
-                    return false;
-            return TryExecuteTask(task);
+            return taskWasPreviouslyQueued
+                ? TryDequeue(task) && TryExecuteTask(task)
+                : TryExecuteTask(task);
         }
 
         /// <summary>
@@ -161,16 +185,24 @@ namespace Helios.Concurrency
         /// <returns>TBD</returns>
         protected override bool TryDequeue(Task task)
         {
-            lock (_tasks) return _tasks.Remove(task);
+            lock (_tasks)
+            {
+                if (_tasks.Remove(task))
+                {
+                    _waitingWork--;
+                    return true;
+                }
+                return false;
+            }
         }
 
         /// <summary>
-        /// Level of concurrency is directly equal to the number of threads
+        /// Level of concurrency is max number of threads
         /// in the <see cref="DedicatedThreadPool"/>.
         /// </summary>
         public override int MaximumConcurrencyLevel
         {
-            get { return _pool.Settings.NumThreads; }
+            get { return _pool.Settings.MaxThreads; }
         }
 
         /// <summary>
@@ -188,41 +220,11 @@ namespace Helios.Concurrency
                 Monitor.TryEnter(_tasks, ref lockTaken);
 
                 //should this be immutable?
-                if (lockTaken) return _tasks;
-                else throw new NotSupportedException();
+                return lockTaken ? _tasks : throw new NotSupportedException();
             }
             finally
             {
                 if (lockTaken) Monitor.Exit(_tasks);
-            }
-        }
-
-        private void EnsureWorkerRequested()
-        {
-            var count = _parallelWorkers;
-            while (count < _pool.Settings.NumThreads)
-            {
-                var prev = Interlocked.CompareExchange(ref _parallelWorkers, count + 1, count);
-                if (prev == count)
-                {
-                    RequestWorker();
-                    break;
-                }
-                count = prev;
-            }
-        }
-
-        private void ReleaseWorker()
-        {
-            var count = _parallelWorkers;
-            while (count > 0)
-            {
-                var prev = Interlocked.CompareExchange(ref _parallelWorkers, count - 1, count);
-                if (prev == count)
-                {
-                    break;
-                }
-                count = prev;
             }
         }
 
@@ -243,13 +245,14 @@ namespace Helios.Concurrency
                             // done processing
                             if (_tasks.Count == 0)
                             {
-                                ReleaseWorker();
+                                _parallelWorkers--;
                                 break;
                             }
 
                             // Get the next item from the queue
                             item = _tasks.First.Value;
                             _tasks.RemoveFirst();
+                            _waitingWork--;
                         }
 
                         // Execute the task we pulled out of the queue
@@ -278,13 +281,13 @@ namespace Helios.Concurrency
             //_workQueue = new ThreadPoolWorkQueue();
             _workChannel = Channel.CreateUnbounded<Action>(new UnboundedChannelOptions
             {
-                //AllowSynchronousContinuations
-                SingleReader = settings.NumThreads == 1
-                //SingleWriter
+                AllowSynchronousContinuations = settings.AllowSynchronousContinuations, //todo check what continuations is syncron
+                SingleReader = settings.NumThreads <= 1 && settings.MaxThreads <= 1,
+                SingleWriter = settings.SynchronousScheduler
             });
-
             Settings = settings;
-            _workers = Enumerable.Range(1, settings.NumThreads).Select(workerId => new PoolWorker(this, workerId)).ToArray();
+            NumThreads = settings.NumThreads;
+            _workers = Enumerable.Range(1, NumThreads).Select(workerId => new PoolWorker(this, workerId)).ToArray();
 
             // Note:
             // The DedicatedThreadPoolSupervisor was removed because aborting thread could lead to unexpected behavior
@@ -297,9 +300,16 @@ namespace Helios.Concurrency
         /// </summary>
         public DedicatedThreadPoolSettings Settings { get; private set; }
 
+        /// <summary>
+        /// active thread count
+        /// </summary>
+        public int NumThreads { get; private set; }
+
         //private readonly ThreadPoolWorkQueue _workQueue;
         private readonly Channel<Action> _workChannel;
-        private readonly PoolWorker[] _workers;
+        private PoolWorker[] _workers;
+
+        private int _cleanCounter = 0;
 
         /// <summary>
         /// TBD
@@ -313,7 +323,55 @@ namespace Helios.Concurrency
             if (work == null)
                 throw new ArgumentNullException(nameof(work), "Work item cannot be null.");
 
-            return _workChannel.Writer.TryWrite(work);
+            if (_workChannel.Writer.TryWrite(work))
+            {
+                if (Settings.SynchronousScheduler && _cleanCounter++ % 50 == 0)
+                {
+                    //todo asyncronous worker management
+
+                    _cleanCounter = 0;
+
+                    var stoppable = Math.Max(0, NumThreads - Settings.MinThreads);
+                    var running = 0;
+
+                    //cleanup workers
+                    for (int i = 0; i < _workers.Length; i++)
+                    {
+                        var idle = _workers[i].Idle;
+                        if (idle == -1) //completed
+                        {
+                            NumThreads--;
+                            stoppable = Math.Max(0, stoppable - 1);
+                        }
+                        else if (stoppable > 0 && idle > 75)
+                        {
+                            _workers[i].Stop();
+                            stoppable--;
+                        }
+                        else if (idle < 10)
+                        {
+                            running++;
+                        }
+                    }
+
+                    //increase workers
+                    if (NumThreads < Settings.MinThreads || (running == NumThreads && NumThreads < Settings.MaxThreads))
+                    {
+                        NumThreads++;
+                        if (_workers.Length < NumThreads)
+                            Array.Resize(ref _workers, NumThreads);
+
+                        //recreate worker
+                        for (int i = 0; i < NumThreads; i++)
+                        {
+                            if (_workers[i] is null || _workers[i].Idle == -1)
+                                _workers[i] = new PoolWorker(this, i);
+                        }
+                    }
+                }
+                return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -343,16 +401,20 @@ namespace Helios.Concurrency
 
         #region Pool worker implementation
 
-        private class PoolWorker
+        private sealed class PoolWorker
         {
             private readonly DedicatedThreadPool _pool;
 
             private readonly TaskCompletionSource<object> _threadExit;
 
+            private bool _stop;
+
             public Task ThreadExit
             {
                 get { return _threadExit.Task; }
             }
+
+            public int Idle { get; private set; } = 10;
 
             public PoolWorker(DedicatedThreadPool pool, int workerId)
             {
@@ -370,16 +432,23 @@ namespace Helios.Concurrency
                 thread.Start();
             }
 
+            public void Stop()
+            {
+                _stop = true;
+            }
+
             private void RunThread()
             {
                 try
                 {
                     var reader = _pool._workChannel.Reader;
 
-                    while (true)
+                    while (!_stop)
                     {
                         if (reader.TryRead(out var action))
                         {
+                            Idle = Math.Max(0, Idle - 1);
+
                             try
                             {
                                 action();
@@ -391,6 +460,8 @@ namespace Helios.Concurrency
                         }
                         else
                         {
+                            Idle = Math.Min(Idle + 2, 100);
+
                             var t = reader.WaitToReadAsync();
                             if (t.IsCompleted ? !t.Result : !t.AsTask().GetAwaiter().GetResult())
                                 return; //completed
@@ -399,6 +470,7 @@ namespace Helios.Concurrency
                 }
                 finally
                 {
+                    Idle = -1;
                     _threadExit.TrySetResult(null);
                 }
             }
@@ -764,4 +836,3 @@ namespace Helios.Concurrency
         #endregion
     }
 }
-
