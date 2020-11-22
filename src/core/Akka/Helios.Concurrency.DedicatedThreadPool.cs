@@ -329,7 +329,7 @@ namespace Helios.Concurrency
                 {
                     //todo asyncronous worker management
 
-                    _cleanCounter = 0;
+                    _cleanCounter = 1;
 
                     var stoppable = Math.Max(0, NumThreads - Settings.MinThreads);
                     var running = 0;
