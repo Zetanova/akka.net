@@ -30,6 +30,7 @@ namespace Helios.Concurrency
         Background
     }
 
+    [Obsolete]
     /// <summary>
     /// Provides settings for a dedicated thread pool
     /// </summary>
@@ -131,15 +132,15 @@ namespace Helios.Concurrency
 
         private readonly LinkedList<Task> _tasks = new LinkedList<Task>();
 
-        private readonly DedicatedThreadPool _pool;  //queue work is synced by _tasks lock
+        public readonly int _maxThreads;
 
         /// <summary>
         /// TBD
         /// </summary>
         /// <param name="pool">TBD</param>
-        public DedicatedThreadPoolTaskScheduler(DedicatedThreadPool pool)
+        public DedicatedThreadPoolTaskScheduler()
         {
-            _pool = pool;
+            _maxThreads = Environment.ProcessorCount; //todo get core count (intel hyper threading)
         }
 
         /// <summary>
@@ -154,7 +155,7 @@ namespace Helios.Concurrency
                 _waitingWork++;
 
                 //request new worker
-                if (_parallelWorkers < _pool.Settings.MaxThreads)
+                if (_parallelWorkers < _maxThreads)
                 {
                     _parallelWorkers++;
                     RequestWorker();
@@ -202,7 +203,7 @@ namespace Helios.Concurrency
         /// </summary>
         public override int MaximumConcurrencyLevel
         {
-            get { return _pool.Settings.MaxThreads; }
+            get { return _maxThreads; }
         }
 
         /// <summary>
@@ -230,7 +231,7 @@ namespace Helios.Concurrency
 
         private void RequestWorker()
         {
-            _pool.QueueUserWorkItem(() =>
+            ThreadPool.UnsafeQueueUserWorkItem((object _) =>
             {
                 // this thread is now available for inlining
                 _currentThreadIsRunningTasks = true;
@@ -261,12 +262,12 @@ namespace Helios.Concurrency
                 }
                 // We're done processing items on the current thread
                 finally { _currentThreadIsRunningTasks = false; }
-            });
+            }, null);
         }
     }
 
 
-
+    [Obsolete]
     /// <summary>
     /// An instanced, dedicated thread pool.
     /// </summary>
