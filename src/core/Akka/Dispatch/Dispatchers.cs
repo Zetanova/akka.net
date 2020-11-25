@@ -115,7 +115,7 @@ namespace Akka.Dispatch
         }
 
         // cache the delegate used for execution to prevent allocations
-        private static readonly Action<object> Executor = t => { ((IRunnable)t).Run(); };
+        //private static readonly Action<object> Executor = t => { ((IRunnable)t).Run(); };
 
         /// <summary>
         /// TBD
@@ -123,7 +123,7 @@ namespace Akka.Dispatch
         /// <param name="run">TBD</param>
         public override void Execute(IRunnable run)
         {
-            var t = new Task(Executor, run);
+            var t = new Task(run.Run);
             t.Start(_scheduler);
         }
 

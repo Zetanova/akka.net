@@ -182,7 +182,11 @@ namespace Akka.Dispatch
         /// <returns>TBD</returns>
         public override ExecutorService Produce(string id)
         {
-            return new ForkJoinExecutor(id, _threadPoolConfiguration);
+            //return new ForkJoinExecutor(id, _threadPoolConfiguration);
+
+            var scheduler = new DedicatedThreadPoolTaskScheduler(_threadPoolConfiguration);
+
+            return new TaskSchedulerExecutor(id, scheduler);
         }
 
         private static DedicatedThreadPoolSettings ConfigureSettings(Config config)

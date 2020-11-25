@@ -51,7 +51,7 @@ namespace Helios.Concurrency
             ThreadType = threadType;
             NumThreads = numThreads;
             MinThreads = Math.Min(2, numThreads);
-            MaxThreads = Math.Max(numThreads, Math.Max(2, Environment.ProcessorCount - 1)); //todo find core count
+            MaxThreads = Math.Max(numThreads, Math.Max(2, Environment.ProcessorCount)); //todo find core count
             DeadlockTimeout = deadlockTimeout;
             ExceptionHandler = exceptionHandler ?? (ex => { });
 
@@ -137,10 +137,16 @@ namespace Helios.Concurrency
         /// <summary>
         /// TBD
         /// </summary>
-        /// <param name="pool">TBD</param>
-        public DedicatedThreadPoolTaskScheduler()
+        /// <param name="settings">TBD</param>
+        public DedicatedThreadPoolTaskScheduler(DedicatedThreadPoolSettings settings)
         {
-            _maxThreads = Environment.ProcessorCount; //todo get core count (intel hyper threading)
+            _maxThreads = Math.Min(settings.NumThreads, settings.MaxThreads); //tmp NumThreads from the legacy setting
+
+            //maybe increase the minThreadcheck on load or in loop 
+            //default minTP is processor count and default _maxThreads too 
+            ThreadPool.GetMinThreads(out var minTP, out var minIO);
+            if (minTP < _maxThreads + 2)
+                ThreadPool.SetMinThreads(_maxThreads + 2, minIO);
         }
 
         /// <summary>
