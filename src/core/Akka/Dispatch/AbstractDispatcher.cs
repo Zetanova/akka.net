@@ -131,8 +131,8 @@ namespace Akka.Dispatch
 
         public override ExecutorService Produce(string id)
         {
-            Prerequisites.EventStream.Publish(new Debug($"ChannelExecutor-[id]", typeof(FixedConcurrencyTaskScheduler), $"Launched Dispatcher [{id}] with MaxParallelism=[{MaxParallelism}]"));
-            return new TaskSchedulerExecutor(id, new FixedConcurrencyTaskScheduler(MaxParallelism));
+            Prerequisites.EventStream.Publish(new Debug($"ChannelExecutor-[id]", typeof(ChannelExecutor), $"Launched Dispatcher [{id}] with MaxParallelism=[{MaxParallelism}]"));
+            return new ChannelExecutor(id, MaxParallelism);
         }
     }
 

@@ -9,6 +9,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Akka.Actor;
 using Akka.Configuration;
@@ -169,6 +170,106 @@ namespace Akka.Dispatch
 
                 _threadRunning = false;
             }
+        }
+    }
+
+
+    /// <summary>
+    /// INTERNAL API
+    ///
+    /// Used to power <see cref="ChannelExecutorConfigurator"/>
+    /// </summary>
+    internal sealed class ChannelExecutor : ExecutorService
+    {
+        private Channel<IRunnable> _channel;
+        private Task _controlTask;
+        private CancellationTokenSource _cts = new CancellationTokenSource();
+
+        public TimeSpan _stepInterval = TimeSpan.FromSeconds(3);
+
+        public int DegreeOfParallelism { get; }
+
+        public ChannelExecutor(string id, int degreeOfParallelism) : base(id)
+        {
+            if (degreeOfParallelism < 1) throw new ArgumentOutOfRangeException(nameof(degreeOfParallelism));
+
+            DegreeOfParallelism = degreeOfParallelism;
+
+            _channel = Channel.CreateUnbounded<IRunnable>(new UnboundedChannelOptions()
+            {
+                AllowSynchronousContinuations = true,
+                SingleReader = degreeOfParallelism == 1,
+                SingleWriter = true
+            });
+
+            _controlTask = Task.Run(ControlAsync, _cts.Token);
+        }
+
+        private async Task ControlAsync()
+        {
+            var reader = _channel.Reader;
+            var cancel = _cts.Token;
+            var reqWorkerCount = 0;
+
+            var workers = new Task[DegreeOfParallelism];
+            for (var i = 0; i < workers.Length; i++)
+                workers[i] = Task.CompletedTask;
+
+            do
+            {
+                //fan out work
+                reqWorkerCount = Math.Min(reader.Count, DegreeOfParallelism);
+                
+                if (reqWorkerCount > 0)
+                {
+                    //count running workers
+                    for (var i = 0; reqWorkerCount > 0 && i < workers.Length; i++)
+                    {
+                        if (!workers[i].IsCompleted)
+                            reqWorkerCount--;
+                    }
+
+                    //start new workers
+                    for (var i = 0; reqWorkerCount > 0 && i < workers.Length; i++)
+                    {
+                        if (workers[i].IsCompleted)
+                        {
+                            workers[i] = Task.Run((Action)Worker, cancel)
+                                .ContinueWith(t => { /* error ignored */ }, TaskContinuationOptions.OnlyOnFaulted);
+                            reqWorkerCount--;
+                        }
+                    }
+
+                    //todo maybe use Timer.Change()
+                    await Task.WhenAny(Task.WhenAll(workers), Task.Delay(_stepInterval, cancel));                 
+                }
+            }
+            while (await reader.WaitToReadAsync(cancel));
+        }
+
+        private void Worker()
+        {
+            var reader = _channel.Reader;
+            var cancel = _cts.Token;
+
+            //maybe implement max work count and/or a deadline
+
+            while(!cancel.IsCancellationRequested && reader.TryRead(out var runnable))
+                runnable.Run();
+
+            //todo return stats
+        }
+
+        public override void Execute(IRunnable run)
+        {
+            if (!_channel.Writer.TryWrite(run) && !_cts.IsCancellationRequested)
+                throw new InvalidOperationException();
+        }
+
+        public override void Shutdown()
+        {
+            _channel.Writer.Complete();
+            _cts.Cancel();
         }
     }
 
