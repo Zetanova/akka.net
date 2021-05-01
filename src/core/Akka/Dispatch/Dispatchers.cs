@@ -181,11 +181,13 @@ namespace Akka.Dispatch
     /// </summary>
     internal sealed class ChannelExecutor : ExecutorService
     {
+        const int WorkInterval = 500;
+
         private Channel<IRunnable> _channel;
         private Task _controlTask;
         private CancellationTokenSource _cts = new CancellationTokenSource();
-
-        public TimeSpan _stepInterval = TimeSpan.FromSeconds(3);
+                
+        private TimeSpan _stepInterval;
 
         public int DegreeOfParallelism { get; }
 
@@ -194,6 +196,7 @@ namespace Akka.Dispatch
             if (degreeOfParallelism < 1) throw new ArgumentOutOfRangeException(nameof(degreeOfParallelism));
 
             DegreeOfParallelism = degreeOfParallelism;
+            _stepInterval = TimeSpan.FromMilliseconds(WorkInterval * Math.Min(DegreeOfParallelism, Environment.ProcessorCount));
 
             _channel = Channel.CreateUnbounded<IRunnable>(new UnboundedChannelOptions()
             {
@@ -210,8 +213,13 @@ namespace Akka.Dispatch
             var reader = _channel.Reader;
             var cancel = _cts.Token;
             var reqWorkerCount = 0;
+            var processorCount = Environment.ProcessorCount;
 
-            var workers = new Task[DegreeOfParallelism];
+            var interval = (int)_stepInterval.TotalMilliseconds;
+            var workParts = Math.Min(DegreeOfParallelism, processorCount);
+            var workInterval = interval / workParts;
+
+            var workers = new Task[Math.Min(DegreeOfParallelism, processorCount)];
             for (var i = 0; i < workers.Length; i++)
                 workers[i] = Task.CompletedTask;
 
@@ -219,9 +227,12 @@ namespace Akka.Dispatch
             {
                 //fan out work
                 reqWorkerCount = Math.Min(reader.Count, DegreeOfParallelism);
-                
+
                 if (reqWorkerCount > 0)
                 {
+                    //low worker count decreases step interval
+                    interval = workInterval * Math.Min(reqWorkerCount, workParts);
+
                     //count running workers
                     for (var i = 0; reqWorkerCount > 0 && i < workers.Length; i++)
                     {
@@ -235,13 +246,41 @@ namespace Akka.Dispatch
                         if (workers[i].IsCompleted)
                         {
                             workers[i] = Task.Run((Action)Worker, cancel)
-                                .ContinueWith(t => { /* error ignored */ }, TaskContinuationOptions.OnlyOnFaulted);
+                                .ContinueWith(_ => { /* error ignored */ }, TaskContinuationOptions.OnlyOnFaulted);
                             reqWorkerCount--;
                         }
                     }
 
-                    //todo maybe use Timer.Change()
-                    await Task.WhenAny(Task.WhenAll(workers), Task.Delay(_stepInterval, cancel));                 
+                    //increase worker array
+                    if(reqWorkerCount > 0)
+                    {
+                        var p = workers.Length;
+                        Array.Resize(ref workers, p + Math.Min(processorCount * Math.Max(1, reqWorkerCount / processorCount), DegreeOfParallelism));
+
+                        for (var i = p; i < workers.Length; i++)
+                        {
+                            if(reqWorkerCount > 0)
+                            {
+                                workers[i] = Task.Run((Action)Worker, cancel)
+                                    .ContinueWith(_ => { /* error ignored */ }, TaskContinuationOptions.OnlyOnFaulted);
+                                reqWorkerCount--;
+                            } 
+                            else
+                            {
+                                workers[i] = Task.CompletedTask;
+                            }
+                        }
+                    }
+
+                    //maybe use Timer.Change()
+                    var workerTask = Task.WhenAll(workers);
+                    var t = await Task.WhenAny(workerTask, Task.Delay(interval, cancel));
+
+                    //decrease worker array to processorCount
+                    if (workers.Length > processorCount && t == workerTask)
+                    {
+                        Array.Resize(ref workers, processorCount);
+                    }
                 }
             }
             while (await reader.WaitToReadAsync(cancel));
