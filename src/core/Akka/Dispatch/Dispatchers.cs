@@ -180,16 +180,18 @@ namespace Akka.Dispatch
     /// </summary>
     internal sealed class ChannelTaskScheduler : TaskScheduler, IDisposable
     {
+        const int WorkInterval = 500;
+        const int WorkerStep = 2;
+
         [ThreadStatic]
         private static bool _threadRunning = false;
 
-        const int WorkInterval = 500;
-
-        private Channel<Task> _channel;
-        private Task _controlTask;
-        private CancellationTokenSource _cts = new CancellationTokenSource();
-
-        private TimeSpan _stepInterval;
+        private readonly Channel<Task> _channel;
+        private readonly Task _controlTask;
+        private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+        private readonly Timer _timer;
+        private readonly Task[] _coworkers;
+        
 
         public ChannelTaskScheduler(int degreeOfParallelism)
         {
@@ -197,15 +199,18 @@ namespace Akka.Dispatch
 
             MaximumConcurrencyLevel = degreeOfParallelism;
 
-            MaximumConcurrencyLevel = degreeOfParallelism;
-            _stepInterval = TimeSpan.FromMilliseconds(WorkInterval * Math.Min(MaximumConcurrencyLevel, Environment.ProcessorCount));
-
             _channel = Channel.CreateUnbounded<Task>(new UnboundedChannelOptions()
             {
                 AllowSynchronousContinuations = true,
                 SingleReader = degreeOfParallelism == 1,
                 SingleWriter = true
             });
+
+            _coworkers = new Task[MaximumConcurrencyLevel - 1];
+            for (var i = 0; i < _coworkers.Length; i++)
+                _coworkers[i] = Task.CompletedTask;
+
+            _timer = new Timer(ScheduleCoWorkers, null, Timeout.Infinite, Timeout.Infinite);
 
             _controlTask = Task.Run(ControlAsync, _cts.Token);
         }
@@ -235,84 +240,90 @@ namespace Akka.Dispatch
         {
             var reader = _channel.Reader;
             var cancel = _cts.Token;
-            var reqWorkerCount = 0;
-            var processorCount = Environment.ProcessorCount;
-
-            var interval = (int)_stepInterval.TotalMilliseconds;
-            var workParts = Math.Min(MaximumConcurrencyLevel, processorCount);
-            var workInterval = interval / workParts;
-
-            var workers = new Task[Math.Min(MaximumConcurrencyLevel, processorCount)];
-            for (var i = 0; i < workers.Length; i++)
-                workers[i] = Task.CompletedTask;
 
             do
             {
-                //fan out work
-                reqWorkerCount = Math.Min(reader.Count, MaximumConcurrencyLevel);
-
-                if (reqWorkerCount > 0)
+                if(reader.TryRead(out var item))
                 {
-                    //low worker count decreases step interval
-                    interval = workInterval * Math.Min(reqWorkerCount, workParts);
-
-                    //count running workers
-                    for (var i = 0; reqWorkerCount > 0 && i < workers.Length; i++)
+                    //schedule coworkers
+                    if (reader.Count > 0)
                     {
-                        if (!workers[i].IsCompleted)
-                            reqWorkerCount--;
+                        _timer.Change(0, Timeout.Infinite);
+                    }
+                    else
+                    {
+                        _timer.Change(WorkInterval, Timeout.Infinite);
                     }
 
-                    //start new workers
-                    for (var i = 0; reqWorkerCount > 0 && i < workers.Length; i++)
+                    //main worker
+                    _threadRunning = true;
+                    try
                     {
-                        if (workers[i].IsCompleted)
+                        do
                         {
-                            workers[i] = Task.Run((Action)Worker, cancel)
-                                .ContinueWith(_ => { /* error ignored */ }, TaskContinuationOptions.OnlyOnFaulted);
-                            reqWorkerCount--;
+                            TryExecuteTask(item);
                         }
+                        while (!cancel.IsCancellationRequested && reader.TryRead(out item));
                     }
-
-                    //increase worker array
-                    if (reqWorkerCount > 0)
+                    catch
                     {
-                        var p = workers.Length;
-                        Array.Resize(ref workers, p + Math.Min(processorCount * Math.Max(1, reqWorkerCount / processorCount), MaximumConcurrencyLevel));
-
-                        for (var i = p; i < workers.Length; i++)
-                        {
-                            if (reqWorkerCount > 0)
-                            {
-                                workers[i] = Task.Run((Action)Worker, cancel)
-                                    .ContinueWith(_ => { /* error ignored */ }, TaskContinuationOptions.OnlyOnFaulted);
-                                reqWorkerCount--;
-                            }
-                            else
-                            {
-                                workers[i] = Task.CompletedTask;
-                            }
-                        }
+                        //ignore error
                     }
-
-                    //maybe use Timer.Change()
-                    var workerTask = Task.WhenAll(workers);
-                    var t = await Task.WhenAny(workerTask, Task.Delay(interval, cancel));
-
-                    //decrease worker array to processorCount
-                    if (workers.Length > processorCount && t == workerTask)
+                    finally
                     {
-                        Array.Resize(ref workers, processorCount);
+                        _threadRunning = false;
                     }
-                }
+
+                    //wait on coworker exit
+                    await Task.WhenAll(_coworkers).ConfigureAwait(false);
+
+                    //stop timer
+                    _timer.Change(Timeout.Infinite, Timeout.Infinite);
+                }             
             }
-            while (await reader.WaitToReadAsync(cancel));
+            while (await reader.WaitToReadAsync(cancel).ConfigureAwait(false));
+           
         }
 
-        protected override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued)
+        private void ScheduleCoWorkers(object state)
         {
-            // If this thread isn't already processing a task, we don't support inlining
-            return _threadRunning ? TryExecuteTask(task) : false;
+            var reqWorkerCount = Math.Min(_channel.Reader.Count, MaximumConcurrencyLevel);
+
+            //count running workers
+            for (var i = 0; reqWorkerCount > 0 && i < _coworkers.Length; i++)
+            {
+                if (!_coworkers[i].IsCompleted)
+                    reqWorkerCount--;
+            }
+
+            //limit new workers
+            var newWorkerToStart = Math.Min(reqWorkerCount, WorkerStep);
+            reqWorkerCount -= newWorkerToStart;
+
+            //start new workers
+            for (var i = 0; newWorkerToStart > 0 && i < _coworkers.Length; i++)
+            {
+                if (_coworkers[i].IsCompleted)
+                {
+                    _coworkers[i] = Task.Run((Action)Worker, _cts.Token);
+                    newWorkerToStart--;
+                }
+            }
+
+            //reschdule
+            if(!_cts.IsCancellationRequested)
+            {
+                if(reqWorkerCount > 0)
+                {
+                    //fast reschdule
+                    _timer.Change(100, Timeout.Infinite);
+                } 
+                else
+                {
+                    //slow reschdule
+                    _timer.Change(WorkInterval * WorkerStep, Timeout.Infinite);
+                }
+            }
         }
 
         private void Worker()
@@ -328,6 +339,10 @@ namespace Akka.Dispatch
                 while (!cancel.IsCancellationRequested && reader.TryRead(out var runnable))
                     TryExecuteTask(runnable);
             }
+            catch
+            {
+                //ignore error
+            }
             finally
             {
                 _threadRunning = false;
@@ -335,11 +350,17 @@ namespace Akka.Dispatch
 
             //todo return stats
         }
+        protected override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued)
+        {
+            // If this thread isn't already processing a task, we don't support inlining
+            return _threadRunning ? TryExecuteTask(task) : false;
+        }
 
         public void Dispose()
         {
             _channel.Writer.TryComplete();
             _cts.Cancel();
+            _timer.Dispose();
         }
     }
 
