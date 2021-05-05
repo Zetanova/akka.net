@@ -173,6 +173,176 @@ namespace Akka.Dispatch
         }
     }
 
+    /// <summary>
+    /// INTERNAL API
+    ///
+    /// Used to power <see cref="ChannelExecutorConfigurator"/>
+    /// </summary>
+    internal sealed class ChannelTaskScheduler : TaskScheduler, IDisposable
+    {
+        [ThreadStatic]
+        private static bool _threadRunning = false;
+
+        const int WorkInterval = 500;
+
+        private Channel<Task> _channel;
+        private Task _controlTask;
+        private CancellationTokenSource _cts = new CancellationTokenSource();
+
+        private TimeSpan _stepInterval;
+
+        public ChannelTaskScheduler(int degreeOfParallelism)
+        {
+            if (degreeOfParallelism < 1) throw new ArgumentOutOfRangeException(nameof(degreeOfParallelism));
+
+            MaximumConcurrencyLevel = degreeOfParallelism;
+
+            MaximumConcurrencyLevel = degreeOfParallelism;
+            _stepInterval = TimeSpan.FromMilliseconds(WorkInterval * Math.Min(MaximumConcurrencyLevel, Environment.ProcessorCount));
+
+            _channel = Channel.CreateUnbounded<Task>(new UnboundedChannelOptions()
+            {
+                AllowSynchronousContinuations = true,
+                SingleReader = degreeOfParallelism == 1,
+                SingleWriter = true
+            });
+
+            _controlTask = Task.Run(ControlAsync, _cts.Token);
+        }
+
+        public override int MaximumConcurrencyLevel { get; }
+
+        /// <summary>
+        /// ONLY USED IN DEBUGGER - NO PERF IMPACT.
+        /// </summary>
+        protected override IEnumerable<Task> GetScheduledTasks()
+        {
+            return Array.Empty<Task>();
+        }
+
+        protected override bool TryDequeue(Task task)
+        {
+            return false;
+        }
+
+        protected override void QueueTask(Task task)
+        {
+            if (!_channel.Writer.TryWrite(task) && !_cts.IsCancellationRequested)
+                throw new InvalidOperationException();
+        }
+
+        private async Task ControlAsync()
+        {
+            var reader = _channel.Reader;
+            var cancel = _cts.Token;
+            var reqWorkerCount = 0;
+            var processorCount = Environment.ProcessorCount;
+
+            var interval = (int)_stepInterval.TotalMilliseconds;
+            var workParts = Math.Min(MaximumConcurrencyLevel, processorCount);
+            var workInterval = interval / workParts;
+
+            var workers = new Task[Math.Min(MaximumConcurrencyLevel, processorCount)];
+            for (var i = 0; i < workers.Length; i++)
+                workers[i] = Task.CompletedTask;
+
+            do
+            {
+                //fan out work
+                reqWorkerCount = Math.Min(reader.Count, MaximumConcurrencyLevel);
+
+                if (reqWorkerCount > 0)
+                {
+                    //low worker count decreases step interval
+                    interval = workInterval * Math.Min(reqWorkerCount, workParts);
+
+                    //count running workers
+                    for (var i = 0; reqWorkerCount > 0 && i < workers.Length; i++)
+                    {
+                        if (!workers[i].IsCompleted)
+                            reqWorkerCount--;
+                    }
+
+                    //start new workers
+                    for (var i = 0; reqWorkerCount > 0 && i < workers.Length; i++)
+                    {
+                        if (workers[i].IsCompleted)
+                        {
+                            workers[i] = Task.Run((Action)Worker, cancel)
+                                .ContinueWith(_ => { /* error ignored */ }, TaskContinuationOptions.OnlyOnFaulted);
+                            reqWorkerCount--;
+                        }
+                    }
+
+                    //increase worker array
+                    if (reqWorkerCount > 0)
+                    {
+                        var p = workers.Length;
+                        Array.Resize(ref workers, p + Math.Min(processorCount * Math.Max(1, reqWorkerCount / processorCount), MaximumConcurrencyLevel));
+
+                        for (var i = p; i < workers.Length; i++)
+                        {
+                            if (reqWorkerCount > 0)
+                            {
+                                workers[i] = Task.Run((Action)Worker, cancel)
+                                    .ContinueWith(_ => { /* error ignored */ }, TaskContinuationOptions.OnlyOnFaulted);
+                                reqWorkerCount--;
+                            }
+                            else
+                            {
+                                workers[i] = Task.CompletedTask;
+                            }
+                        }
+                    }
+
+                    //maybe use Timer.Change()
+                    var workerTask = Task.WhenAll(workers);
+                    var t = await Task.WhenAny(workerTask, Task.Delay(interval, cancel));
+
+                    //decrease worker array to processorCount
+                    if (workers.Length > processorCount && t == workerTask)
+                    {
+                        Array.Resize(ref workers, processorCount);
+                    }
+                }
+            }
+            while (await reader.WaitToReadAsync(cancel));
+        }
+
+        protected override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued)
+        {
+            // If this thread isn't already processing a task, we don't support inlining
+            return _threadRunning ? TryExecuteTask(task) : false;
+        }
+
+        private void Worker()
+        {
+            var reader = _channel.Reader;
+            var cancel = _cts.Token;
+
+            //maybe implement max work count and/or a deadline
+
+            _threadRunning = true;
+            try
+            {
+                while (!cancel.IsCancellationRequested && reader.TryRead(out var runnable))
+                    TryExecuteTask(runnable);
+            }
+            finally
+            {
+                _threadRunning = false;
+            }
+
+            //todo return stats
+        }
+
+        public void Dispose()
+        {
+            _channel.Writer.TryComplete();
+            _cts.Cancel();
+        }
+    }
+
 
     /// <summary>
     /// INTERNAL API
@@ -186,7 +356,7 @@ namespace Akka.Dispatch
         private Channel<IRunnable> _channel;
         private Task _controlTask;
         private CancellationTokenSource _cts = new CancellationTokenSource();
-                
+
         private TimeSpan _stepInterval;
 
         public int DegreeOfParallelism { get; }
@@ -252,19 +422,19 @@ namespace Akka.Dispatch
                     }
 
                     //increase worker array
-                    if(reqWorkerCount > 0)
+                    if (reqWorkerCount > 0)
                     {
                         var p = workers.Length;
                         Array.Resize(ref workers, p + Math.Min(processorCount * Math.Max(1, reqWorkerCount / processorCount), DegreeOfParallelism));
 
                         for (var i = p; i < workers.Length; i++)
                         {
-                            if(reqWorkerCount > 0)
+                            if (reqWorkerCount > 0)
                             {
                                 workers[i] = Task.Run((Action)Worker, cancel)
                                     .ContinueWith(_ => { /* error ignored */ }, TaskContinuationOptions.OnlyOnFaulted);
                                 reqWorkerCount--;
-                            } 
+                            }
                             else
                             {
                                 workers[i] = Task.CompletedTask;
@@ -293,7 +463,7 @@ namespace Akka.Dispatch
 
             //maybe implement max work count and/or a deadline
 
-            while(!cancel.IsCancellationRequested && reader.TryRead(out var runnable))
+            while (!cancel.IsCancellationRequested && reader.TryRead(out var runnable))
                 runnable.Run();
 
             //todo return stats
