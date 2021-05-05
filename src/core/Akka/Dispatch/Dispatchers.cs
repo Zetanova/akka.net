@@ -191,7 +191,7 @@ namespace Akka.Dispatch
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
         private readonly Timer _timer;
         private readonly Task[] _coworkers;
-        
+
 
         public ChannelTaskScheduler(int degreeOfParallelism)
         {
@@ -243,7 +243,7 @@ namespace Akka.Dispatch
 
             do
             {
-                if(reader.TryRead(out var item))
+                if (reader.TryRead(out var item))
                 {
                     //schedule coworkers
                     if (reader.Count > 0)
@@ -279,10 +279,9 @@ namespace Akka.Dispatch
 
                     //stop timer
                     _timer.Change(Timeout.Infinite, Timeout.Infinite);
-                }             
+                }
             }
             while (await reader.WaitToReadAsync(cancel).ConfigureAwait(false));
-           
         }
 
         private void ScheduleCoWorkers(object state)
@@ -311,13 +310,13 @@ namespace Akka.Dispatch
             }
 
             //reschdule
-            if(!_cts.IsCancellationRequested)
+            if (!_cts.IsCancellationRequested)
             {
-                if(reqWorkerCount > 0)
+                if (reqWorkerCount > 0)
                 {
                     //fast reschdule
                     _timer.Change(100, Timeout.Infinite);
-                } 
+                }
                 else
                 {
                     //slow reschdule
