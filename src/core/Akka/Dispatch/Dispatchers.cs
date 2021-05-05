@@ -246,14 +246,7 @@ namespace Akka.Dispatch
                 if (reader.TryRead(out var item))
                 {
                     //schedule coworkers
-                    if (reader.Count > 0)
-                    {
-                        _timer.Change(0, Timeout.Infinite);
-                    }
-                    else
-                    {
-                        _timer.Change(WorkInterval, Timeout.Infinite);
-                    }
+                    ScheduleCoWorkers(null);
 
                     //main worker
                     _threadRunning = true;
@@ -278,13 +271,14 @@ namespace Akka.Dispatch
                     await Task.WhenAll(_coworkers).ConfigureAwait(false);
 
                     //stop timer
-                    _timer.Change(Timeout.Infinite, Timeout.Infinite);
+                    if (!_cts.IsCancellationRequested)
+                        _timer.Change(Timeout.Infinite, Timeout.Infinite);
                 }
             }
             while (await reader.WaitToReadAsync(cancel).ConfigureAwait(false));
         }
 
-        private void ScheduleCoWorkers(object state)
+        private void ScheduleCoWorkers(object _)
         {
             var reqWorkerCount = Math.Min(_channel.Reader.Count, MaximumConcurrencyLevel);
 
@@ -312,16 +306,10 @@ namespace Akka.Dispatch
             //reschdule
             if (!_cts.IsCancellationRequested)
             {
-                if (reqWorkerCount > 0)
-                {
-                    //fast reschdule
-                    _timer.Change(100, Timeout.Infinite);
-                }
-                else
-                {
-                    //slow reschdule
-                    _timer.Change(WorkInterval * WorkerStep, Timeout.Infinite);
-                }
+                var interval = reqWorkerCount > 0
+                    ? WorkInterval / WorkerStep
+                    : WorkInterval * WorkerStep;
+                _timer.Change(interval, Timeout.Infinite);
             }
         }
 
